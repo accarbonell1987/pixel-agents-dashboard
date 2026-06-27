@@ -6,6 +6,7 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { AgentsRoomWatcher, type RoomAgent } from "./agentsRoomWatcher.js";
+import { OpencodeWatcher } from "./opencodeWatcher.js";
 import { JsonlWatcher, type WatchedFile } from "./watcher.js";
 import { processTranscriptLine } from "./parser.js";
 import {
@@ -26,6 +27,7 @@ const agents = new Map<string, { id: number; folderName: string; needsInput: boo
 const idByKey = new Map<string, number>(); // agentId -> stable numeric id
 const sessionToId = new Map<string, number>(); // claudeSessionId -> numeric id (for live JSONL activity)
 const parserState = new Map<string, TrackedAgent>(); // claudeSessionId -> parser tool state
+const ocToolState = new Map<string, string | null>(); // opencode agent key -> last emitted tool status
 let nextAgentId = 1;
 const clients = new Set<WebSocket>();
 let lastActivityTime = Date.now();
@@ -166,11 +168,17 @@ function sendInitialData(ws: WebSocket): void {
     ws.send(JSON.stringify({ type: "layoutLoaded", layout: null, version: 0 }));
   }
 
-  // Replay needs-input AFTER layout — characters only exist once the layout is
-  // applied, so the bubble would no-op if sent any earlier. Live tool activity
-  // is not replayed (the parser has no history); it resumes on the next event.
-  for (const a of agentList) {
+  // Replay live state AFTER layout — characters only exist once the layout is
+  // applied, so these would no-op if sent any earlier. (Claude JSONL tool
+  // activity still isn't replayed — the parser keeps no snapshot — but opencode
+  // activity is tracked in ocToolState, so we can restore it for fresh clients.)
+  for (const [key, a] of agents) {
     if (a.needsInput) ws.send(JSON.stringify({ type: "agentToolPermission", id: a.id }));
+    const tool = ocToolState.get(key);
+    if (tool) {
+      ws.send(JSON.stringify({ type: "agentStatus", id: a.id, status: "active" }));
+      ws.send(JSON.stringify({ type: "agentToolStart", id: a.id, toolId: `oc:tool:${key}`, status: tool }));
+    }
   }
 }
 
@@ -249,18 +257,41 @@ function linkSession(id: number, sessionId: string): void {
   if (sessionId) sessionToId.set(sessionId, id);
 }
 
-watcher.on("agentJoined", (a: RoomAgent) => {
+// Drive typing/reading animation for sources that poll their own activity
+// (opencode). No-op for AgentsRoom agents (Claude activity comes from the JSONL
+// parser, which leaves toolStatus undefined). Runs BEFORE the needs-input bubble
+// so agentToolsClear (which also clears bubbles) can't clobber it.
+function applyLiveActivity(id: number, key: string, a: RoomAgent): void {
+  if (a.toolStatus === undefined) return;
+  const prevTool = ocToolState.get(key) ?? null;
+  const nextTool = a.active ? a.toolStatus ?? null : null;
+  if (nextTool === prevTool) return;
+  if (nextTool !== null) {
+    broadcast({ type: "agentStatus", id, status: "active" });
+    broadcast({ type: "agentToolsClear", id });
+    broadcast({ type: "agentToolStart", id, toolId: `oc:tool:${key}`, status: nextTool });
+  } else {
+    broadcast({ type: "agentToolsClear", id });
+    broadcast({ type: "agentStatus", id, status: "idle" });
+  }
+  ocToolState.set(key, nextTool);
+}
+
+// Shared handlers — both AgentsRoom and opencode emit the same RoomAgent shape,
+// so they feed the exact same lifecycle (label, project color, zones, needs-input).
+function onAgentJoined(a: RoomAgent): void {
   lastActivityTime = Date.now();
   const id = numericId(a.key);
   const folderName = labelFor(a);
   agents.set(a.key, { id, folderName, needsInput: a.needsInput, claudeSessionId: a.claudeSessionId, projectName: a.projectName, projectColor: a.projectColor });
   linkSession(id, a.claudeSessionId);
   broadcast({ type: "agentCreated", id, folderName, projectName: a.projectName, projectColor: a.projectColor });
+  applyLiveActivity(id, a.key, a);
   if (a.needsInput) broadcast({ type: "agentToolPermission", id });
   console.log(`Agent ${id} joined: ${folderName}`);
-});
+}
 
-watcher.on("agentChanged", (a: RoomAgent) => {
+function onAgentChanged(a: RoomAgent): void {
   lastActivityTime = Date.now();
   const id = numericId(a.key);
   const folderName = labelFor(a);
@@ -272,28 +303,41 @@ watcher.on("agentChanged", (a: RoomAgent) => {
   if (respawned) {
     broadcast({ type: "agentClosed", id });
     broadcast({ type: "agentCreated", id, folderName, projectName: a.projectName, projectColor: a.projectColor });
+    ocToolState.delete(a.key); // force activity to re-emit onto the fresh character
   }
+  applyLiveActivity(id, a.key, a);
   // Only touch the needs-input bubble when it actually changes (or after a
-  // respawn cleared it) — otherwise we'd clobber the parser's tool-permission
-  // bubble on every unrelated poll.
+  // respawn cleared it). Runs AFTER applyLiveActivity so the bubble survives.
   if (respawned || prev?.needsInput !== a.needsInput) {
     broadcast(a.needsInput ? { type: "agentToolPermission", id } : { type: "agentToolPermissionClear", id });
   }
   agents.set(a.key, { id, folderName, needsInput: a.needsInput, claudeSessionId: a.claudeSessionId, projectName: a.projectName, projectColor: a.projectColor });
   linkSession(id, a.claudeSessionId);
-});
+}
 
-watcher.on("agentLeft", (key: string) => {
+function onAgentLeft(key: string): void {
   const rec = agents.get(key);
   if (!rec) return;
   agents.delete(key);
+  ocToolState.delete(key);
   if (rec.claudeSessionId) {
     sessionToId.delete(rec.claudeSessionId);
     parserState.delete(rec.claudeSessionId);
   }
   broadcast({ type: "agentClosed", id: rec.id });
   console.log(`Agent ${rec.id} left`);
-});
+}
+
+watcher.on("agentJoined", onAgentJoined);
+watcher.on("agentChanged", onAgentChanged);
+watcher.on("agentLeft", onAgentLeft);
+
+// opencode watcher — surfaces opencode sessions (e.g. deepseek agents) from its
+// SQLite store as characters too, grouped into the same project zones.
+const opencode = new OpencodeWatcher();
+opencode.on("agentJoined", onAgentJoined);
+opencode.on("agentChanged", onAgentChanged);
+opencode.on("agentLeft", onAgentLeft);
 
 // JSONL watcher — drives live tool animations (typing/reading) for agents that
 // have a Claude Code session. Lifecycle/labels stay owned by AgentsRoom, so we
@@ -332,9 +376,10 @@ jsonl.on("line", (file: WatchedFile, line: string) => {
 // Start
 watcher.start();
 jsonl.start();
+opencode.start();
 server.listen(PORT, () => {
   console.log(`Pixel Agents server running at http://localhost:${PORT}`);
-  console.log(`Watching ~/.agentsroom (agents) + ~/.claude/projects (live activity)...`);
+  console.log(`Watching ~/.agentsroom + ~/.claude/projects + opencode.db...`);
 });
 
 // Idle shutdown
@@ -343,6 +388,7 @@ setInterval(() => {
     console.log("No active sessions or clients for 10 minutes, shutting down...");
     watcher.stop();
     jsonl.stop();
+    opencode.stop();
     server.close();
     process.exit(0);
   }

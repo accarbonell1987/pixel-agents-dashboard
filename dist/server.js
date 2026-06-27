@@ -2,10 +2,10 @@
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import { join as join4, dirname as dirname3 } from "path";
-import { homedir as homedir3 } from "os";
+import { join as join5, dirname as dirname3 } from "path";
+import { homedir as homedir4 } from "os";
 import { fileURLToPath } from "url";
-import { existsSync as existsSync3, readFileSync as readFileSync3, writeFileSync, mkdirSync } from "fs";
+import { existsSync as existsSync4, readFileSync as readFileSync4, writeFileSync, mkdirSync } from "fs";
 
 // server/agentsRoomWatcher.ts
 import { readFileSync, existsSync } from "fs";
@@ -76,16 +76,172 @@ var AgentsRoomWatcher = class extends EventEmitter {
   }
 };
 
+// server/opencodeWatcher.ts
+import { execFile } from "child_process";
+import { readFileSync as readFileSync2, existsSync as existsSync2 } from "fs";
+import { join as join2, basename } from "path";
+import { homedir as homedir2 } from "os";
+import { EventEmitter as EventEmitter2 } from "events";
+var DB_PATH = join2(homedir2(), ".local", "share", "opencode", "opencode.db");
+var CONFIG_PATH2 = join2(homedir2(), ".agentsroom", "config.json");
+var POLL_INTERVAL_MS2 = 3e3;
+var ACTIVE_WINDOW_MIN = 30;
+var QUERY = `
+  with active as (
+    select id, parent_id, directory, title, agent,
+           json_extract(model,'$.providerID') as provider,
+           json_extract(model,'$.id') as model_id
+    from session
+    where time_archived is null
+      and time_updated > (strftime('%s','now')*1000 - ${ACTIVE_WINDOW_MIN}*60*1000)
+  )
+  select a.*,
+         json_extract(p.data,'$.type') as ptype,
+         json_extract(p.data,'$.tool') as tool,
+         json_extract(p.data,'$.state.status') as status,
+         json_extract(p.data,'$.state.input.filePath') as filePath,
+         json_extract(p.data,'$.state.input.command') as command
+  from active a
+  left join part p on p.id = (
+    select id from part where session_id = a.id order by time_created desc limit 1
+  );`;
+var BASH_MAX = 30;
+function base(filePath) {
+  return filePath ? basename(filePath) : "";
+}
+function formatTool(tool, filePath, command) {
+  switch ((tool ?? "").toLowerCase()) {
+    case "read":
+      return `Reading ${base(filePath)}`;
+    case "edit":
+    case "patch":
+      return `Editing ${base(filePath)}`;
+    case "write":
+      return `Writing ${base(filePath)}`;
+    case "bash": {
+      const cmd = command ?? "";
+      return `Running: ${cmd.length > BASH_MAX ? cmd.slice(0, BASH_MAX) + "\u2026" : cmd}`;
+    }
+    case "grep":
+      return "Searching code";
+    case "glob":
+    case "list":
+      return "Globbing files";
+    case "webfetch":
+      return "Fetching web content";
+    case "websearch":
+      return "Searching the web";
+    case "task":
+      return "Task: subtask";
+    default:
+      return `Using ${tool ?? "tool"}`;
+  }
+}
+function readProjectMap() {
+  if (!existsSync2(CONFIG_PATH2)) return [];
+  try {
+    const config = JSON.parse(readFileSync2(CONFIG_PATH2, "utf-8"));
+    return (config?.projects ?? []).map((p) => ({
+      name: p.name,
+      directoryPath: p.directoryPath,
+      color: p.colorHex ?? "#888888"
+    }));
+  } catch {
+    return [];
+  }
+}
+function signature2(a) {
+  return `${a.role}|${a.title}|${a.projectName}|${a.needsInput}|${a.active}|${a.toolStatus}`;
+}
+var OpencodeWatcher = class extends EventEmitter2 {
+  agents = /* @__PURE__ */ new Map();
+  timer = null;
+  warned = false;
+  start() {
+    if (!existsSync2(DB_PATH)) return;
+    this.scan();
+    this.timer = setInterval(() => this.scan(), POLL_INTERVAL_MS2);
+  }
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+  }
+  scan() {
+    execFile(
+      "sqlite3",
+      ["-json", `file:${DB_PATH}?mode=ro`, QUERY],
+      { maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          if (!this.warned) {
+            console.warn(`[opencode] cannot read sessions: ${err.message}`);
+            this.warned = true;
+          }
+          return;
+        }
+        let rows;
+        try {
+          rows = stdout.trim() ? JSON.parse(stdout) : [];
+        } catch {
+          return;
+        }
+        this.diff(rows);
+      }
+    );
+  }
+  diff(rows) {
+    const projects = readProjectMap();
+    const seen = /* @__PURE__ */ new Set();
+    for (const row of rows) {
+      const key = `oc:${row.id}`;
+      const proj = projects.find((p) => p.directoryPath && row.directory.startsWith(p.directoryPath));
+      const provider = row.provider ?? "opencode";
+      const role = row.parent_id ? `\u21B3 ${row.agent}` : `${provider} \xB7 ${row.agent}`;
+      const isTool = row.ptype === "tool";
+      const running = isTool && row.status === "running";
+      const pending = isTool && row.status === "pending";
+      const next = {
+        key,
+        projectName: proj?.name ?? basename(row.directory),
+        projectColor: proj?.color ?? "#6E7681",
+        role,
+        model: row.model_id ?? "",
+        title: row.title ?? "",
+        type: "",
+        needsInput: pending,
+        claudeSessionId: "",
+        // no Claude JSONL — activity driven below, not by parser
+        active: running,
+        toolStatus: running ? formatTool(row.tool, row.filePath, row.command) : null
+      };
+      seen.add(key);
+      const prev = this.agents.get(key);
+      if (!prev) {
+        this.agents.set(key, next);
+        this.emit("agentJoined", next);
+      } else if (signature2(prev) !== signature2(next)) {
+        this.agents.set(key, next);
+        this.emit("agentChanged", next);
+      }
+    }
+    for (const key of [...this.agents.keys()]) {
+      if (!seen.has(key)) {
+        this.agents.delete(key);
+        this.emit("agentLeft", key);
+      }
+    }
+  }
+};
+
 // server/watcher.ts
 import { watch } from "chokidar";
 import { statSync, readdirSync, openSync, readSync, closeSync } from "fs";
-import { join as join2, basename, dirname } from "path";
-import { homedir as homedir2 } from "os";
-import { EventEmitter as EventEmitter2 } from "events";
-var CLAUDE_PROJECTS_DIR = join2(homedir2(), ".claude", "projects");
+import { join as join3, basename as basename2, dirname } from "path";
+import { homedir as homedir3 } from "os";
+import { EventEmitter as EventEmitter3 } from "events";
+var CLAUDE_PROJECTS_DIR = join3(homedir3(), ".claude", "projects");
 var ACTIVE_THRESHOLD_MS = 6e5;
-var POLL_INTERVAL_MS2 = 1e3;
-var JsonlWatcher = class extends EventEmitter2 {
+var POLL_INTERVAL_MS3 = 1e3;
+var JsonlWatcher = class extends EventEmitter3 {
   files = /* @__PURE__ */ new Map();
   watcher = null;
   pollInterval = null;
@@ -100,7 +256,7 @@ var JsonlWatcher = class extends EventEmitter2 {
         this.addFile(filePath);
       }
     });
-    this.pollInterval = setInterval(() => this.pollFiles(), POLL_INTERVAL_MS2);
+    this.pollInterval = setInterval(() => this.pollFiles(), POLL_INTERVAL_MS3);
   }
   stop() {
     this.watcher?.close();
@@ -111,12 +267,12 @@ var JsonlWatcher = class extends EventEmitter2 {
       const dirs = readdirSync(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
       for (const dir of dirs) {
         if (!dir.isDirectory()) continue;
-        const dirPath = join2(CLAUDE_PROJECTS_DIR, dir.name);
+        const dirPath = join3(CLAUDE_PROJECTS_DIR, dir.name);
         try {
           const files = readdirSync(dirPath);
           for (const f of files) {
             if (!f.endsWith(".jsonl")) continue;
-            const filePath = join2(dirPath, f);
+            const filePath = join3(dirPath, f);
             const stat = statSync(filePath);
             if (Date.now() - stat.mtimeMs < ACTIVE_THRESHOLD_MS) {
               this.addFile(filePath);
@@ -130,8 +286,8 @@ var JsonlWatcher = class extends EventEmitter2 {
   }
   addFile(filePath) {
     if (this.files.has(filePath)) return;
-    const sessionId = basename(filePath, ".jsonl");
-    const projectDirName = basename(dirname(filePath));
+    const sessionId = basename2(filePath, ".jsonl");
+    const projectDirName = basename2(dirname(filePath));
     const parts = projectDirName.split("-").filter(Boolean);
     const projectName = parts[parts.length - 1] || sessionId.slice(0, 8);
     const file = {
@@ -201,14 +357,14 @@ var waitingTimers = /* @__PURE__ */ new Map();
 var permissionTimers = /* @__PURE__ */ new Map();
 var idleTimeoutTimers = /* @__PURE__ */ new Map();
 function formatToolStatus(toolName, input) {
-  const base = (p) => typeof p === "string" ? path.basename(p) : "";
+  const base2 = (p) => typeof p === "string" ? path.basename(p) : "";
   switch (toolName) {
     case "Read":
-      return `Reading ${base(input.file_path)}`;
+      return `Reading ${base2(input.file_path)}`;
     case "Edit":
-      return `Editing ${base(input.file_path)}`;
+      return `Editing ${base2(input.file_path)}`;
     case "Write":
-      return `Writing ${base(input.file_path)}`;
+      return `Writing ${base2(input.file_path)}`;
     case "Bash": {
       const cmd = input.command || "";
       return `Running: ${cmd.length > BASH_COMMAND_DISPLAY_MAX_LENGTH ? cmd.slice(0, BASH_COMMAND_DISPLAY_MAX_LENGTH) + "\u2026" : cmd}`;
@@ -748,24 +904,25 @@ var agents = /* @__PURE__ */ new Map();
 var idByKey = /* @__PURE__ */ new Map();
 var sessionToId = /* @__PURE__ */ new Map();
 var parserState = /* @__PURE__ */ new Map();
+var ocToolState = /* @__PURE__ */ new Map();
 var nextAgentId = 1;
 var clients = /* @__PURE__ */ new Set();
 var lastActivityTime = Date.now();
-var devAssetsRoot = join4(__dirname, "..", "webview-ui", "public", "assets");
-var prodAssetsRoot = join4(__dirname, "public", "assets");
-var assetsRoot = existsSync3(devAssetsRoot) ? devAssetsRoot : prodAssetsRoot;
+var devAssetsRoot = join5(__dirname, "..", "webview-ui", "public", "assets");
+var prodAssetsRoot = join5(__dirname, "public", "assets");
+var assetsRoot = existsSync4(devAssetsRoot) ? devAssetsRoot : prodAssetsRoot;
 console.log(`[Server] Loading assets from: ${assetsRoot}`);
 var characterSprites = loadCharacterSprites(assetsRoot);
 var wallTiles = loadWallTiles(assetsRoot);
 var floorTiles = loadFloorTiles(assetsRoot);
 var furnitureAssets = loadFurnitureAssets(assetsRoot);
-var persistDir = join4(homedir3(), ".pixel-agents");
-var persistedLayoutPath = join4(persistDir, "layout.json");
-var persistedSeatsPath = join4(persistDir, "agent-seats.json");
+var persistDir = join5(homedir4(), ".pixel-agents");
+var persistedLayoutPath = join5(persistDir, "layout.json");
+var persistedSeatsPath = join5(persistDir, "agent-seats.json");
 function loadLayout() {
-  if (existsSync3(persistedLayoutPath)) {
+  if (existsSync4(persistedLayoutPath)) {
     try {
-      const content = readFileSync3(persistedLayoutPath, "utf-8");
+      const content = readFileSync4(persistedLayoutPath, "utf-8");
       const layout = JSON.parse(content);
       console.log(`[Server] Loaded persisted layout from ${persistedLayoutPath}`);
       return layout;
@@ -776,9 +933,9 @@ function loadLayout() {
   return loadDefaultLayout(assetsRoot);
 }
 function loadPersistedSeats() {
-  if (existsSync3(persistedSeatsPath)) {
+  if (existsSync4(persistedSeatsPath)) {
     try {
-      const content = readFileSync3(persistedSeatsPath, "utf-8");
+      const content = readFileSync4(persistedSeatsPath, "utf-8");
       return JSON.parse(content);
     } catch {
       return null;
@@ -789,7 +946,7 @@ function loadPersistedSeats() {
 var currentLayout = loadLayout();
 var persistedSeats = loadPersistedSeats();
 var app = express();
-app.use(express.static(join4(__dirname, "public")));
+app.use(express.static(join5(__dirname, "public")));
 var server = createServer(app);
 var wss = new WebSocketServer({ server });
 var HEARTBEAT_INTERVAL_MS = 3e4;
@@ -851,8 +1008,13 @@ function sendInitialData(ws) {
   } else {
     ws.send(JSON.stringify({ type: "layoutLoaded", layout: null, version: 0 }));
   }
-  for (const a of agentList) {
+  for (const [key, a] of agents) {
     if (a.needsInput) ws.send(JSON.stringify({ type: "agentToolPermission", id: a.id }));
+    const tool = ocToolState.get(key);
+    if (tool) {
+      ws.send(JSON.stringify({ type: "agentStatus", id: a.id, status: "active" }));
+      ws.send(JSON.stringify({ type: "agentToolStart", id: a.id, toolId: `oc:tool:${key}`, status: tool }));
+    }
   }
 }
 wss.on("connection", (ws) => {
@@ -919,17 +1081,33 @@ function numericId(key) {
 function linkSession(id, sessionId) {
   if (sessionId) sessionToId.set(sessionId, id);
 }
-watcher.on("agentJoined", (a) => {
+function applyLiveActivity(id, key, a) {
+  if (a.toolStatus === void 0) return;
+  const prevTool = ocToolState.get(key) ?? null;
+  const nextTool = a.active ? a.toolStatus ?? null : null;
+  if (nextTool === prevTool) return;
+  if (nextTool !== null) {
+    broadcast({ type: "agentStatus", id, status: "active" });
+    broadcast({ type: "agentToolsClear", id });
+    broadcast({ type: "agentToolStart", id, toolId: `oc:tool:${key}`, status: nextTool });
+  } else {
+    broadcast({ type: "agentToolsClear", id });
+    broadcast({ type: "agentStatus", id, status: "idle" });
+  }
+  ocToolState.set(key, nextTool);
+}
+function onAgentJoined(a) {
   lastActivityTime = Date.now();
   const id = numericId(a.key);
   const folderName = labelFor(a);
   agents.set(a.key, { id, folderName, needsInput: a.needsInput, claudeSessionId: a.claudeSessionId, projectName: a.projectName, projectColor: a.projectColor });
   linkSession(id, a.claudeSessionId);
   broadcast({ type: "agentCreated", id, folderName, projectName: a.projectName, projectColor: a.projectColor });
+  applyLiveActivity(id, a.key, a);
   if (a.needsInput) broadcast({ type: "agentToolPermission", id });
   console.log(`Agent ${id} joined: ${folderName}`);
-});
-watcher.on("agentChanged", (a) => {
+}
+function onAgentChanged(a) {
   lastActivityTime = Date.now();
   const id = numericId(a.key);
   const folderName = labelFor(a);
@@ -938,24 +1116,34 @@ watcher.on("agentChanged", (a) => {
   if (respawned) {
     broadcast({ type: "agentClosed", id });
     broadcast({ type: "agentCreated", id, folderName, projectName: a.projectName, projectColor: a.projectColor });
+    ocToolState.delete(a.key);
   }
+  applyLiveActivity(id, a.key, a);
   if (respawned || prev?.needsInput !== a.needsInput) {
     broadcast(a.needsInput ? { type: "agentToolPermission", id } : { type: "agentToolPermissionClear", id });
   }
   agents.set(a.key, { id, folderName, needsInput: a.needsInput, claudeSessionId: a.claudeSessionId, projectName: a.projectName, projectColor: a.projectColor });
   linkSession(id, a.claudeSessionId);
-});
-watcher.on("agentLeft", (key) => {
+}
+function onAgentLeft(key) {
   const rec = agents.get(key);
   if (!rec) return;
   agents.delete(key);
+  ocToolState.delete(key);
   if (rec.claudeSessionId) {
     sessionToId.delete(rec.claudeSessionId);
     parserState.delete(rec.claudeSessionId);
   }
   broadcast({ type: "agentClosed", id: rec.id });
   console.log(`Agent ${rec.id} left`);
-});
+}
+watcher.on("agentJoined", onAgentJoined);
+watcher.on("agentChanged", onAgentChanged);
+watcher.on("agentLeft", onAgentLeft);
+var opencode = new OpencodeWatcher();
+opencode.on("agentJoined", onAgentJoined);
+opencode.on("agentChanged", onAgentChanged);
+opencode.on("agentLeft", onAgentLeft);
 var jsonl = new JsonlWatcher();
 jsonl.on("line", (file, line) => {
   const id = sessionToId.get(file.sessionId);
@@ -987,15 +1175,17 @@ jsonl.on("line", (file, line) => {
 });
 watcher.start();
 jsonl.start();
+opencode.start();
 server.listen(PORT, () => {
   console.log(`Pixel Agents server running at http://localhost:${PORT}`);
-  console.log(`Watching ~/.agentsroom (agents) + ~/.claude/projects (live activity)...`);
+  console.log(`Watching ~/.agentsroom + ~/.claude/projects + opencode.db...`);
 });
 setInterval(() => {
   if (agents.size === 0 && clients.size === 0 && Date.now() - lastActivityTime > IDLE_SHUTDOWN_MS) {
     console.log("No active sessions or clients for 10 minutes, shutting down...");
     watcher.stop();
     jsonl.stop();
+    opencode.stop();
     server.close();
     process.exit(0);
   }

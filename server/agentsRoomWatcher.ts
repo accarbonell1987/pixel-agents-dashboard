@@ -19,6 +19,10 @@ export interface RoomAgent {
   needsInput: boolean;
   claudeSessionId: string; // links to ~/.claude/projects/**/<id>.jsonl ("" if none)
   projectColor: string; // config.json colorHex — groups agents by project
+  // Live-activity fields, only set by sources that poll it themselves (opencode).
+  // Left undefined by AgentsRoom (Claude activity comes from the JSONL parser).
+  active?: boolean;
+  toolStatus?: string | null; // formatted running-tool status, or null when idle
 }
 
 function readJson(path: string): any | null {
