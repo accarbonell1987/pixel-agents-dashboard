@@ -1065,10 +1065,12 @@ var ROLE_LABEL = {
   brainstormer: "Brainstormer",
   devops: "DevOps"
 };
+var LABEL_MAX = 34;
 function labelFor(a) {
   const role = ROLE_LABEL[a.role] ?? a.role;
   const task = a.title.trim();
-  return task ? `${role}: ${task}` : role;
+  const full = task ? `${role}: ${task}` : role;
+  return full.length > LABEL_MAX ? full.slice(0, LABEL_MAX - 1).trimEnd() + "\u2026" : full;
 }
 function numericId(key) {
   let id = idByKey.get(key);

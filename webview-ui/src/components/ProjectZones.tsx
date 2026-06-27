@@ -50,17 +50,24 @@ export function ProjectZones({ officeState, agents, containerRef, zoom, panRef }
   for (const id of agents) {
     const ch = officeState.characters.get(id)
     if (!ch?.projectName || !ch.projectColor) continue
+    // Anchor the zone to each agent's SEAT (fixed), not its live position —
+    // characters wander, which would balloon the box to cover the whole office.
+    const seat = ch.seatId ? officeState.seats.get(ch.seatId) : null
+    const wx = seat ? seat.seatCol * TILE_SIZE + TILE_SIZE / 2 : ch.x
+    const wy = seat ? seat.seatRow * TILE_SIZE + TILE_SIZE / 2 : ch.y
     const z = zones.get(ch.projectName)
     if (!z) {
-      zones.set(ch.projectName, { name: ch.projectName, color: ch.projectColor, minX: ch.x, minY: ch.y, maxX: ch.x, maxY: ch.y })
+      zones.set(ch.projectName, { name: ch.projectName, color: ch.projectColor, minX: wx, minY: wy, maxX: wx, maxY: wy })
     } else {
-      z.minX = Math.min(z.minX, ch.x)
-      z.minY = Math.min(z.minY, ch.y)
-      z.maxX = Math.max(z.maxX, ch.x)
-      z.maxY = Math.max(z.maxY, ch.y)
+      z.minX = Math.min(z.minX, wx)
+      z.minY = Math.min(z.minY, wy)
+      z.maxX = Math.max(z.maxX, wx)
+      z.maxY = Math.max(z.maxY, wy)
     }
   }
-  if (zones.size === 0) return null
+  // With a single project the box adds no information (and reads as a "weird
+  // box around everyone") — only draw zones when there are 2+ projects to tell apart.
+  if (zones.size < 2) return null
 
   const pad = TILE_SIZE * 1.2
   const toScreenX = (worldX: number) => (deviceOffsetX + worldX * zoom) / dpr

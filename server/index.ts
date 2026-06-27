@@ -236,10 +236,13 @@ const ROLE_LABEL: Record<string, string> = {
   devops: "DevOps",
 };
 
+const LABEL_MAX = 34;
+
 function labelFor(a: RoomAgent): string {
   const role = ROLE_LABEL[a.role] ?? a.role;
   const task = a.title.trim();
-  return task ? `${role}: ${task}` : role;
+  const full = task ? `${role}: ${task}` : role;
+  return full.length > LABEL_MAX ? full.slice(0, LABEL_MAX - 1).trimEnd() + "…" : full;
 }
 
 function numericId(key: string): number {
